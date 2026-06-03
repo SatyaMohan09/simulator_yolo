@@ -83,27 +83,45 @@ public class ObstacleRegistryService {
         return loadDynamicObstacle2Obstacles();
     }
 
-    public ObstacleSyncResult syncRuntimeObstacles(List<Obstacle> detections, List<Obstacle> birdDetections) {
-        List<Obstacle> normalizedDetections = deduplicate(detections);
-        List<Obstacle> normalizedBirds = deduplicate(birdDetections);
+    /**
+     * Syncs runtime detections from YOLO and returns a result that clearly
+     * identifies whether static obstacles changed, bird obstacles changed,
+     * or both — so the caller can trigger the right scope of replan.
+     */
+    public ObstacleSyncResult syncRuntimeObstacles(List<Obstacle> detections,
+                                                    List<Obstacle> birdDetections) {
 
-        List<Obstacle> previousDetections = loadDetectedObstacles();
-        List<Obstacle> previousBirds = loadDynamicObstacle2Obstacles();
+        List<Obstacle> normalizedDetections  = deduplicate(detections);
+        List<Obstacle> normalizedBirds       = deduplicate(birdDetections);
 
-        writeObstaclesCsv(detectedObstacleFilePath, normalizedDetections);
-        writeObstaclesCsv(dynamicObstacleFilePath, normalizedBirds);
+        List<Obstacle> previousDetections    = loadDetectedObstacles();
+        List<Obstacle> previousBirds         = loadDynamicObstacle2Obstacles();
 
-        boolean changed = !sameObstacleSet(previousDetections, normalizedDetections)
-                || !sameObstacleSet(previousBirds, normalizedBirds);
+        boolean staticChanged = !sameObstacleSet(previousDetections, normalizedDetections);
+        boolean birdsChanged  = !sameObstacleSet(previousBirds,      normalizedBirds);
 
-        return new ObstacleSyncResult(normalizedDetections, normalizedBirds, changed);
+        // Only write files when there is an actual change — avoids unnecessary
+        // disk I/O and reduces the race window for concurrent trajectory reads.
+        if (staticChanged) {
+            writeObstaclesCsv(detectedObstacleFilePath, normalizedDetections);
+        }
+        if (birdsChanged) {
+            writeObstaclesCsv(dynamicObstacleFilePath,  normalizedBirds);
+        }
+
+        return new ObstacleSyncResult(
+                normalizedDetections,
+                normalizedBirds,
+                staticChanged,
+                birdsChanged
+        );
     }
 
     public ObstacleSnapshotResponse getSnapshot() {
         List<Obstacle> imageProcessing = loadImageProcessingObstacles();
-        List<Obstacle> seed = loadSeedObstacles();
-        List<Obstacle> detected = loadDetectedObstacles();
-        List<Obstacle> planner = loadPlannerObstacles(List.of());
+        List<Obstacle> seed            = loadSeedObstacles();
+        List<Obstacle> detected        = loadDetectedObstacles();
+        List<Obstacle> planner         = loadPlannerObstacles(List.of());
         return new ObstacleSnapshotResponse(imageProcessing, seed, detected, planner);
     }
 
@@ -111,51 +129,41 @@ public class ObstacleRegistryService {
         List<Obstacle> imageProcessing = deduplicate(loadImageProcessingObstacles());
 
         int safeSeedCount = Math.max(0, seedCount);
-        int limit = Math.min(safeSeedCount, imageProcessing.size());
+        int limit         = Math.min(safeSeedCount, imageProcessing.size());
 
-        writeObstaclesCsv(seedObstacleFilePath, imageProcessing.subList(0, limit));
+        writeObstaclesCsv(seedObstacleFilePath,     imageProcessing.subList(0, limit));
         writeObstaclesCsv(detectedObstacleFilePath, List.of());
-        writeObstaclesCsv(dynamicObstacleFilePath, List.of());
+        writeObstaclesCsv(dynamicObstacleFilePath,  List.of());
         return getSnapshot();
     }
 
     public ObstacleSnapshotResponse revealSurpriseObstacles(int count) {
         List<Obstacle> imageProcessing = deduplicate(loadImageProcessingObstacles());
-        List<Obstacle> seed = loadSeedObstacles();
-        List<Obstacle> detected = loadDetectedObstacles();
+        List<Obstacle> seed            = loadSeedObstacles();
+        List<Obstacle> detected        = loadDetectedObstacles();
 
         Map<String, Obstacle> known = new LinkedHashMap<>();
         for (Obstacle obstacle : seed) {
             Obstacle normalized = normalize(obstacle);
-            if (normalized != null) {
-                known.put(buildKey(normalized), normalized);
-            }
+            if (normalized != null) known.put(buildKey(normalized), normalized);
         }
         for (Obstacle obstacle : detected) {
             Obstacle normalized = normalize(obstacle);
-            if (normalized != null) {
-                known.put(buildKey(normalized), normalized);
-            }
+            if (normalized != null) known.put(buildKey(normalized), normalized);
         }
 
         int revealLimit = Math.max(0, count);
         List<Obstacle> surprises = new ArrayList<>(detected);
         for (Obstacle obstacle : imageProcessing) {
             Obstacle normalized = normalize(obstacle);
-            if (normalized == null) {
-                continue;
-            }
+            if (normalized == null) continue;
 
             String key = buildKey(normalized);
-            if (known.containsKey(key)) {
-                continue;
-            }
+            if (known.containsKey(key)) continue;
 
             surprises.add(normalized);
             known.put(key, normalized);
-            if (surprises.size() - detected.size() >= revealLimit) {
-                break;
-            }
+            if (surprises.size() - detected.size() >= revealLimit) break;
         }
 
         writeObstaclesCsv(detectedObstacleFilePath, deduplicate(surprises));
@@ -164,37 +172,29 @@ public class ObstacleRegistryService {
 
     public ObstacleValidationResponse validateDetectedAgainstGroundTruth() {
         List<Obstacle> groundTruth = loadGroundTruthObstacles();
-        List<Obstacle> detected = loadDetectedObstacles();
+        List<Obstacle> detected    = loadDetectedObstacles();
 
         if (groundTruth.isEmpty() || detected.isEmpty()) {
             return new ObstacleValidationResponse(
-                    groundTruth.size(),
-                    detected.size(),
-                    0,
-                    groundTruth.size(),
-                    detected.size(),
-                    matchThresholdM,
-                    null,
-                    null);
+                    groundTruth.size(), detected.size(),
+                    0, groundTruth.size(), detected.size(),
+                    matchThresholdM, null, null);
         }
 
         boolean[] matchedDetections = new boolean[detected.size()];
-        List<Double> errors = new ArrayList<>();
-        int matchedCount = 0;
+        List<Double> errors         = new ArrayList<>();
+        int matchedCount            = 0;
 
         for (Obstacle truth : groundTruth) {
-            int nearestIndex = -1;
+            int    nearestIndex    = -1;
             double nearestDistance = Double.POSITIVE_INFINITY;
 
             for (int i = 0; i < detected.size(); i++) {
-                if (matchedDetections[i]) {
-                    continue;
-                }
-
+                if (matchedDetections[i]) continue;
                 double distance = distance(truth, detected.get(i));
                 if (distance < nearestDistance) {
                     nearestDistance = distance;
-                    nearestIndex = i;
+                    nearestIndex    = i;
                 }
             }
 
@@ -206,47 +206,30 @@ public class ObstacleRegistryService {
         }
 
         int unmatchedDetections = 0;
-        for (boolean matched : matchedDetections) {
-            if (!matched) {
-                unmatchedDetections++;
-            }
-        }
+        for (boolean matched : matchedDetections) if (!matched) unmatchedDetections++;
 
-        int missedCount = groundTruth.size() - matchedCount;
-        Double meanError = errors.isEmpty()
-                ? null
+        int    missedCount = groundTruth.size() - matchedCount;
+        Double meanError   = errors.isEmpty() ? null
                 : errors.stream().mapToDouble(Double::doubleValue).average().orElse(0.0);
-        Double maxError = errors.isEmpty()
-                ? null
+        Double maxError    = errors.isEmpty() ? null
                 : errors.stream().mapToDouble(Double::doubleValue).max().orElse(0.0);
 
         return new ObstacleValidationResponse(
-                groundTruth.size(),
-                detected.size(),
-                matchedCount,
-                missedCount,
-                unmatchedDetections,
-                matchThresholdM,
-                meanError,
-                maxError);
+                groundTruth.size(), detected.size(),
+                matchedCount, missedCount, unmatchedDetections,
+                matchThresholdM, meanError, maxError);
     }
+
+    // ── private helpers ───────────────────────────────────────────────────────
 
     private List<Obstacle> deduplicate(List<Obstacle> obstacles) {
         Map<String, Obstacle> deduped = new LinkedHashMap<>();
-        if (obstacles == null) {
-            return new ArrayList<>();
-        }
+        if (obstacles == null) return new ArrayList<>();
 
         for (Obstacle obstacle : obstacles) {
-            if (obstacle == null) {
-                continue;
-            }
-
+            if (obstacle == null) continue;
             Obstacle normalized = normalize(obstacle);
-            if (normalized == null) {
-                continue;
-            }
-
+            if (normalized == null) continue;
             deduped.put(buildKey(normalized), normalized);
         }
 
@@ -287,37 +270,24 @@ public class ObstacleRegistryService {
     private boolean sameObstacleSet(List<Obstacle> left, List<Obstacle> right) {
         List<Obstacle> a = deduplicate(left);
         List<Obstacle> b = deduplicate(right);
-        if (a.size() != b.size()) {
-            return false;
-        }
-
+        if (a.size() != b.size()) return false;
         for (int i = 0; i < a.size(); i++) {
-            if (!comparableRow(a.get(i)).equals(comparableRow(b.get(i)))) {
-                return false;
-            }
+            if (!comparableRow(a.get(i)).equals(comparableRow(b.get(i)))) return false;
         }
-
         return true;
     }
 
     private String comparableRow(Obstacle obstacle) {
-        return String.format(
-                Locale.US,
-                "%.2f|%.2f|%.2f|%.2f",
-                obstacle.getX(),
-                obstacle.getY(),
-                obstacle.getZ(),
-                obstacle.getRadius());
+        return String.format(Locale.US, "%.2f|%.2f|%.2f|%.2f",
+                obstacle.getX(), obstacle.getY(),
+                obstacle.getZ(), obstacle.getRadius());
     }
 
     private String buildKey(Obstacle obstacle) {
-        return Math.round(obstacle.getX() / 20.0)
-                + ":"
-                + Math.round(obstacle.getY() / 20.0)
-                + ":"
-                + Math.round(obstacle.getZ() / 20.0)
-                + ":"
-                + Math.round(obstacle.getRadius() / 10.0);
+        return Math.round(obstacle.getX()      / 20.0) + ":"
+             + Math.round(obstacle.getY()      / 20.0) + ":"
+             + Math.round(obstacle.getZ()      / 20.0) + ":"
+             + Math.round(obstacle.getRadius() / 10.0);
     }
 
     private double distance(Obstacle a, Obstacle b) {
@@ -336,65 +306,56 @@ public class ObstacleRegistryService {
     }
 
     private String trimToNull(String value) {
-        if (value == null) {
-            return null;
-        }
+        if (value == null) return null;
         String trimmed = value.trim();
         return trimmed.isEmpty() ? null : trimmed;
     }
 
-    private String safeString(String value) {
-        return value == null ? "" : value;
-    }
-
-    private String safeNumber(Double value) {
-        return value == null ? "" : String.format(Locale.US, "%.2f", value);
-    }
-
-    private List<Obstacle> mergeLists(List<Obstacle> left, List<Obstacle> right) {
-        List<Obstacle> merged = new ArrayList<>();
-        if (left != null) {
-            merged.addAll(left);
-        }
-        if (right != null) {
-            merged.addAll(right);
-        }
-        return merged;
-    }
-
     private void writeObstaclesCsv(String filePath, List<Obstacle> obstacles) {
-        if (filePath == null || filePath.isBlank()) {
-            return;
-        }
+        if (filePath == null || filePath.isBlank()) return;
 
         Path path = csvObstacleDataProvider.resolveConfiguredFile(filePath).toPath();
         List<String> lines = new ArrayList<>();
         lines.add("x,y,z,radius");
 
         for (Obstacle obstacle : obstacles) {
-            lines.add(String.format(
-                    Locale.US,
-                    "%.2f,%.2f,%.2f,%.2f",
-                    obstacle.getX(),
-                    obstacle.getY(),
-                    obstacle.getZ(),
-                    obstacle.getRadius()));
+            lines.add(String.format(Locale.US, "%.2f,%.2f,%.2f,%.2f",
+                    obstacle.getX(), obstacle.getY(),
+                    obstacle.getZ(), obstacle.getRadius()));
         }
 
         try {
             Path parent = path.getParent();
-            if (parent != null) {
-                Files.createDirectories(parent);
-            }
+            if (parent != null) Files.createDirectories(parent);
             Files.write(path, lines, StandardCharsets.UTF_8);
         } catch (IOException e) {
             throw new IllegalStateException("Failed to write obstacle CSV: " + filePath, e);
         }
     }
 
+    // ── result record ─────────────────────────────────────────────────────────
+
+    /**
+     * Result of a runtime obstacle sync.
+     *
+     * <p>{@code staticChanged} is true when the set of detected (non-bird)
+     * obstacles changed.  A full trajectory replan is required.</p>
+     *
+     * <p>{@code birdsChanged} is true when only the dynamic bird obstacles
+     * changed.  Only a partial (D* Lite) replan is required.</p>
+     *
+     * <p>Both flags can be true simultaneously when a single YOLO frame
+     * introduces both a new building detection and new bird positions.</p>
+     */
     public record ObstacleSyncResult(
             List<Obstacle> detectedObstacles,
             List<Obstacle> dynamicBirdObstacles,
-            boolean changed) {
+            boolean staticChanged,
+            boolean birdsChanged) {
+
+        /** True if anything at all changed and a replan of any kind is needed. */
+        public boolean anyChanged() {
+            return staticChanged || birdsChanged;
+        }
     }
 }

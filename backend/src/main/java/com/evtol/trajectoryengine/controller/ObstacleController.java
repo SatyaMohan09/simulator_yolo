@@ -19,7 +19,7 @@ import java.util.Map;
 @RequiredArgsConstructor
 public class ObstacleController {
 
-    private final ObstacleRegistryService obstacleRegistryService;
+    private final ObstacleRegistryService   obstacleRegistryService;
     private final TrajectoryBroadcastService trajectoryBroadcastService;
 
     /** Full snapshot: imageProcessing + detected + merged planner list. */
@@ -30,8 +30,6 @@ public class ObstacleController {
 
     /**
      * Classified view used by the frontend to colour buildings.
-     * Returns the backend-known static set and the current YOLO-detected set
-     * so the UI can distinguish white (known), orange (surprise), red (detected).
      */
     @GetMapping("/classified")
     public Map<String, List<Obstacle>> getClassifiedObstacles() {
@@ -42,8 +40,7 @@ public class ObstacleController {
     }
 
     /**
-     * Demo helper: keep only the first N imageprocessing obstacles as static,
-     * known backend obstacles and clear all surprise detections.
+     * Demo helper: keep only the first N imageprocessing obstacles as static.
      */
     @PostMapping("/demo/bootstrap-static")
     public ObstacleSnapshotResponse bootstrapStaticScenario(
@@ -52,8 +49,7 @@ public class ObstacleController {
     }
 
     /**
-     * Demo helper: reveal additional obstacles from the imageprocessing feed as
-     * runtime surprises so the planner must react mid-flight.
+     * Demo helper: reveal additional surprise obstacles at runtime.
      */
     @PostMapping("/demo/reveal-surprises")
     public ObstacleSnapshotResponse revealSurpriseObstacles(
@@ -61,10 +57,7 @@ public class ObstacleController {
         return obstacleRegistryService.revealSurpriseObstacles(count);
     }
 
-    /**
-     * Returns only YOLO-detected obstacles.
-     * Frontend overlays these in a different colour without needing the seed list.
-     */
+    /** Returns only YOLO-detected static obstacles. */
     @GetMapping("/detected")
     public List<Obstacle> getDetectedObstacles() {
         return obstacleRegistryService.loadDetectedObstacles();
@@ -72,14 +65,19 @@ public class ObstacleController {
 
     /**
      * YOLO service POSTs its detections here every frame.
-     * Replaces the current detected set, mirrors bird detections into
-     * dynamic_obstacle2.csv, and triggers a trajectory replan whenever the
-     * runtime obstacle state changes.
+     *
+     * <p>The sync result now clearly tells us what changed:</p>
+     * <ul>
+     *   <li>Static obstacles changed → full replan (RRT* + B-spline refit)</li>
+     *   <li>Only birds changed       → bird replan (D* Lite only, no RRT*)</li>
+     *   <li>Nothing changed          → no replan at all</li>
+     * </ul>
      */
     @PostMapping("/detections")
     public List<Obstacle> syncDetections(
             @RequestBody(required = false) ObstacleSyncRequest request) {
-        List<Obstacle> detections = request != null && request.getObstacles() != null
+
+        List<Obstacle> detections     = request != null && request.getObstacles() != null
                 ? request.getObstacles()
                 : List.of();
         List<Obstacle> birdDetections = request != null && request.getBirdObstacles() != null
@@ -89,9 +87,17 @@ public class ObstacleController {
         ObstacleRegistryService.ObstacleSyncResult syncResult =
                 obstacleRegistryService.syncRuntimeObstacles(detections, birdDetections);
 
-        if (syncResult.changed()) {
-            trajectoryBroadcastService.scheduleReplan();
+        if (syncResult.staticChanged()) {
+            // Static buildings changed — full replan required.
+            // This also covers birds because the full pipeline reads bird
+            // obstacles too, so no separate bird replan is needed.
+            trajectoryBroadcastService.scheduleFullReplan();
+
+        } else if (syncResult.birdsChanged()) {
+            // Only dynamic bird positions changed — partial replan is enough.
+            trajectoryBroadcastService.scheduleBirdReplan();
         }
+        // If nothing changed, we do nothing — no unnecessary replan.
 
         return syncResult.detectedObstacles();
     }
