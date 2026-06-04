@@ -23,51 +23,215 @@ public class DStarLitePlanner {
     private static final int REJOIN_LOOKAHEAD_WAYPOINTS = 6;
     private static final int MAX_EXTRACT_STEPS = 5_000;
     private static final double INF = 1e15;
+   
+    public DStarResult plan(
+        List<Waypoint> sourceWaypoints,
+        List<Obstacle> obstacles) {
 
-    public List<Waypoint> plan(List<Waypoint> sourceWaypoints, List<Obstacle> obstacles) {
-        if (sourceWaypoints == null || sourceWaypoints.size() < 2 || obstacles == null || obstacles.isEmpty()) {
-            return sourceWaypoints;
-        }
+    if (sourceWaypoints == null
+            || sourceWaypoints.size() < 2
+            || obstacles == null
+            || obstacles.isEmpty()) {
 
-        CollisionWindow collisionWindow = findCollisionWindow(sourceWaypoints, obstacles);
-        if (collisionWindow == null) {
-            return sourceWaypoints;
-        }
-
-        int rejoinIndex = Math.min(
-                sourceWaypoints.size() - 1,
-                collisionWindow.lastCollisionSegment + REJOIN_LOOKAHEAD_WAYPOINTS + 1);
-        int preIndex = Math.max(0, collisionWindow.firstCollisionSegment - 1);
-
-        Waypoint start = sourceWaypoints.get(preIndex);
-        Waypoint goal = sourceWaypoints.get(rejoinIndex);
-
-        GridBounds bounds = buildBounds(sourceWaypoints, obstacles, preIndex, rejoinIndex);
-        Cell startCell = worldToCell(start.getX(), start.getZ(), bounds);
-        Cell goalCell = worldToCell(goal.getX(), goal.getZ(), bounds);
-
-        Set<Cell> blocked = buildBlockedCells(bounds, obstacles, startCell, goalCell);
-        blocked.remove(startCell);
-        blocked.remove(goalCell);
-
-        List<Point2> detour = planGridPath(startCell, goalCell, bounds, blocked);
-        if (detour.isEmpty()) {
-            return sourceWaypoints;
-        }
-
-        List<Point2> mergedPath = new ArrayList<>();
-        for (int i = 0; i <= preIndex; i++) {
-            mergedPath.add(new Point2(sourceWaypoints.get(i).getX(), sourceWaypoints.get(i).getZ()));
-        }
-        for (int i = 1; i < detour.size() - 1; i++) {
-            mergedPath.add(detour.get(i));
-        }
-        for (int i = rejoinIndex; i < sourceWaypoints.size(); i++) {
-            mergedPath.add(new Point2(sourceWaypoints.get(i).getX(), sourceWaypoints.get(i).getZ()));
-        }
-
-        return resamplePath(mergedPath, sourceWaypoints);
+        return new DStarResult(
+                sourceWaypoints,
+                -1,
+                -1,
+                false);
     }
+
+    CollisionWindow collisionWindow =
+            findCollisionWindow(sourceWaypoints, obstacles);
+
+    if (collisionWindow == null) {
+        return new DStarResult(
+                sourceWaypoints,
+                -1,
+                -1,
+                false);
+    }
+
+    int rejoinIndex = Math.min(
+            sourceWaypoints.size() - 1,
+            collisionWindow.lastCollisionSegment
+                    + REJOIN_LOOKAHEAD_WAYPOINTS
+                    + 1);
+
+    int preIndex = Math.max(
+            0,
+            collisionWindow.firstCollisionSegment - 1);
+
+    Waypoint start = sourceWaypoints.get(preIndex);
+    Waypoint goal = sourceWaypoints.get(rejoinIndex);
+
+    GridBounds bounds =
+            buildBounds(
+                    sourceWaypoints,
+                    obstacles,
+                    preIndex,
+                    rejoinIndex);
+
+    Cell startCell =
+            worldToCell(
+                    start.getX(),
+                    start.getZ(),
+                    bounds);
+
+    Cell goalCell =
+            worldToCell(
+                    goal.getX(),
+                    goal.getZ(),
+                    bounds);
+
+    Set<Cell> blocked =
+            buildBlockedCells(
+                    bounds,
+                    obstacles,
+                    startCell,
+                    goalCell);
+
+    blocked.remove(startCell);
+    blocked.remove(goalCell);
+
+    List<Point2> detour =
+            planGridPath(
+                    startCell,
+                    goalCell,
+                    bounds,
+                    blocked);
+
+    if (detour.isEmpty()) {
+        return new DStarResult(
+                sourceWaypoints,
+                -1,
+                -1,
+                false);
+    }
+
+    List<Point2> mergedPath = new ArrayList<>();
+
+    for (int i = 0; i <= preIndex; i++) {
+        mergedPath.add(
+                new Point2(
+                        sourceWaypoints.get(i).getX(),
+                        sourceWaypoints.get(i).getZ()));
+    }
+
+    for (int i = 1; i < detour.size() - 1; i++) {
+        mergedPath.add(detour.get(i));
+    }
+
+    for (int i = rejoinIndex;
+         i < sourceWaypoints.size();
+         i++) {
+
+        mergedPath.add(
+                new Point2(
+                        sourceWaypoints.get(i).getX(),
+                        sourceWaypoints.get(i).getZ()));
+    }
+
+    List<Waypoint> result =
+        new ArrayList<>(sourceWaypoints);
+
+int affectedCount =
+        rejoinIndex - preIndex + 1;
+
+double[] cumulativeDistance =
+        new double[detour.size()];
+
+for (int i = 1; i < detour.size(); i++) {
+
+    Point2 a = detour.get(i - 1);
+    Point2 b = detour.get(i);
+
+    cumulativeDistance[i] =
+            cumulativeDistance[i - 1]
+                    + Math.hypot(
+                            b.x - a.x,
+                            b.z - a.z);
+}
+
+double totalLength =
+        cumulativeDistance[cumulativeDistance.length - 1];
+
+if (totalLength < 1e-6) {
+    return new DStarResult(
+            sourceWaypoints,
+            -1,
+            -1,
+            false);
+}
+
+int pathIndex = 1;
+
+for (int i = 0; i < affectedCount; i++) {
+
+    double alpha =
+            affectedCount == 1
+                    ? 0.0
+                    : (double) i / (affectedCount - 1);
+
+    double targetDistance =
+            alpha * totalLength;
+
+    while (pathIndex < cumulativeDistance.length - 1
+            && cumulativeDistance[pathIndex] < targetDistance) {
+
+        pathIndex++;
+    }
+
+    int prevIndex =
+            Math.max(0, pathIndex - 1);
+
+    Point2 p0 =
+            detour.get(prevIndex);
+
+    Point2 p1 =
+            detour.get(pathIndex);
+
+    double segmentLength =
+            cumulativeDistance[pathIndex]
+                    - cumulativeDistance[prevIndex];
+
+    double localAlpha =
+            segmentLength > 1e-6
+                    ? (targetDistance
+                    - cumulativeDistance[prevIndex])
+                    / segmentLength
+                    : 0.0;
+
+    int waypointIndex =
+            preIndex + i;
+
+    if (waypointIndex >= sourceWaypoints.size()) {
+        break;
+    }
+
+    Waypoint original =
+            sourceWaypoints.get(waypointIndex);
+
+    result.set(
+            waypointIndex,
+            new Waypoint(
+                    original.getT(),
+                    lerp(
+                            p0.x,
+                            p1.x,
+                            localAlpha),
+                    original.getY(),
+                    lerp(
+                            p0.z,
+                            p1.z,
+                            localAlpha)));
+}
+
+return new DStarResult(
+        result,
+        preIndex,
+        rejoinIndex,
+        true);
+}
 
     private CollisionWindow findCollisionWindow(List<Waypoint> waypoints, List<Obstacle> obstacles) {
         Integer first = null;
@@ -359,53 +523,96 @@ public class DStarLitePlanner {
         return new Point2(x, z);
     }
 
-    private List<Waypoint> resamplePath(List<Point2> path, List<Waypoint> source) {
-        if (path.size() < 2) {
-            return source;
-        }
+    private List<Waypoint> resampleLocalWindow(
+        List<Point2> path,
+        List<Waypoint> source,
+        int startIndex,
+        int endIndex) {
 
-        double[] cumulativeDistance = new double[path.size()];
-        for (int i = 1; i < path.size(); i++) {
-            Point2 a = path.get(i - 1);
-            Point2 b = path.get(i);
-            cumulativeDistance[i] = cumulativeDistance[i - 1] + Math.hypot(b.x - a.x, b.z - a.z);
-        }
+    if (path.size() < 2) {
+        return source;
+    }
 
-        double total = cumulativeDistance[cumulativeDistance.length - 1];
-        if (total < 1e-6) {
-            return source;
-        }
+    List<Waypoint> result = new ArrayList<>(source);
 
-        List<Waypoint> result = new ArrayList<>(source.size());
-        int pathIndex = 1;
+    int windowSize = endIndex - startIndex + 1;
 
-        for (int i = 0; i < source.size(); i++) {
-            double alpha = source.size() == 1 ? 0.0 : (double) i / (source.size() - 1);
-            double targetDistance = alpha * total;
-            while (pathIndex < cumulativeDistance.length - 1 && cumulativeDistance[pathIndex] < targetDistance) {
-                pathIndex++;
-            }
-
-            int prevIndex = Math.max(0, pathIndex - 1);
-            Point2 p0 = path.get(prevIndex);
-            Point2 p1 = path.get(pathIndex);
-            double segmentLength = cumulativeDistance[pathIndex] - cumulativeDistance[prevIndex];
-            double localAlpha = segmentLength > 1e-6
-                    ? (targetDistance - cumulativeDistance[prevIndex]) / segmentLength
-                    : 0.0;
-
-            result.add(new Waypoint(
-                    source.get(i).getT(),
-                    lerp(p0.x, p1.x, localAlpha),
-                    source.get(i).getY(),
-                    lerp(p0.z, p1.z, localAlpha)));
-        }
-
-        result.set(0, source.get(0));
-        result.set(result.size() - 1, source.get(source.size() - 1));
+    if (windowSize < 2) {
         return result;
     }
 
+    double[] cumulativeDistance = new double[path.size()];
+
+    for (int i = 1; i < path.size(); i++) {
+        Point2 a = path.get(i - 1);
+        Point2 b = path.get(i);
+
+        cumulativeDistance[i] =
+                cumulativeDistance[i - 1]
+                        + Math.hypot(
+                                b.x - a.x,
+                                b.z - a.z);
+    }
+
+    double totalDistance =
+            cumulativeDistance[cumulativeDistance.length - 1];
+
+    if (totalDistance < 1e-6) {
+        return result;
+    }
+
+    int pathIndex = 1;
+
+    for (int wp = startIndex; wp <= endIndex; wp++) {
+
+        double alpha =
+                windowSize == 1
+                        ? 0.0
+                        : (double) (wp - startIndex)
+                        / (windowSize - 1);
+
+        double targetDistance =
+                alpha * totalDistance;
+
+        while (pathIndex < cumulativeDistance.length - 1
+                && cumulativeDistance[pathIndex] < targetDistance) {
+            pathIndex++;
+        }
+
+        int prevIndex =
+                Math.max(0, pathIndex - 1);
+
+        Point2 p0 = path.get(prevIndex);
+        Point2 p1 = path.get(pathIndex);
+
+        double segmentLength =
+                cumulativeDistance[pathIndex]
+                        - cumulativeDistance[prevIndex];
+
+        double localAlpha =
+                segmentLength > 1e-6
+                        ? (targetDistance
+                        - cumulativeDistance[prevIndex])
+                        / segmentLength
+                        : 0.0;
+
+        Waypoint original =
+                source.get(wp);
+
+        result.set(
+                wp,
+                new Waypoint(
+                        original.getT(),
+                        lerp(p0.x, p1.x, localAlpha),
+                        original.getY(),
+                        lerp(p0.z, p1.z, localAlpha)));
+    }
+
+    result.set(startIndex, source.get(startIndex));
+    result.set(endIndex, source.get(endIndex));
+
+    return result;
+}
     private double lerp(double a, double b, double t) {
         return a + (b - a) * t;
     }

@@ -132,7 +132,24 @@ public class SamplingService {
                 break;
             }
         }
+        
+        int removed = 0;
 
+        for (TrajectoryPoint point : base) {
+
+            double t = point.getT();
+
+            if (t < windowStart || t > windowEnd) {
+                result.add(point);
+            } else {
+                removed++;
+            }
+        }
+
+        System.out.printf(
+            "[PATCH] removed=%d patch=%d%n",
+            removed,
+            patch.size());
         result.addAll(insertAt, patch);
         return result;
     }

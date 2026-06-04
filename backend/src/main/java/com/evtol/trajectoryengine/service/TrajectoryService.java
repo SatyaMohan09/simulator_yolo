@@ -10,6 +10,7 @@ import com.evtol.trajectoryengine.dto.TrajectoryResponse;
 import com.evtol.trajectoryengine.fitting.LeastSquaresFitter;
 import com.evtol.trajectoryengine.planning.DStarLitePlanner;
 import com.evtol.trajectoryengine.planning.RrtStarPlanner;
+import com.evtol.trajectoryengine.planning.DStarResult;
 import com.evtol.trajectoryengine.spline.CubicSplineBuilder;
 import com.evtol.trajectoryengine.validation.WaypointValidator;
 import lombok.RequiredArgsConstructor;
@@ -88,7 +89,8 @@ public class TrajectoryService {
                 afterRrt, controlPoints, trajectoryModel, basePoints, lambda);
 
         // 7. D* Lite — bird avoidance applied on top of the cached base
-        List<Waypoint> afterDStar = applyDStarAvoidance(afterRrt, birdObstacles);
+        DStarResult dStarResult = applyDStarAvoidance(afterRrt, birdObstacles);
+        List<Waypoint> afterDStar = dStarResult.waypoints();
 
         // 8. If D* Lite made no change, the base points are the final answer —
         //    no need to resample.
@@ -97,8 +99,12 @@ public class TrajectoryService {
             finalPoints = basePoints;
         } else {
             // D* Lite modified some waypoints — rebuild only the affected window.
-            finalPoints = applyBirdPatch(afterDStar, afterRrt,
-                                          trajectoryModel, basePoints);
+            finalPoints = applyBirdPatch(
+        afterDStar,
+        dStarResult.affectedStartIndex(),
+        dStarResult.affectedEndIndex(),
+        trajectoryModel,
+        basePoints);
         }
 
         return new TrajectoryResponse(
@@ -125,8 +131,8 @@ public class TrajectoryService {
         List<Obstacle> birdObstacles = obstacleRegistryService.loadBirdObstacles();
 
         // D* Lite only — runs against the cached base waypoints
-        List<Waypoint> afterDStar =
-                applyDStarAvoidance(cache.getBaseWaypoints(), birdObstacles);
+        DStarResult dStarResult = applyDStarAvoidance(cache.getBaseWaypoints(), birdObstacles);
+        List<Waypoint> afterDStar = dStarResult.waypoints();
 
         // If nothing changed, return the cached base trajectory as-is.
         // No resampling, no B-spline work at all.
@@ -142,10 +148,17 @@ public class TrajectoryService {
 
         // D* Lite changed something — splice only the affected window.
         List<TrajectoryPoint> finalPoints = applyBirdPatch(
-                afterDStar,
-                cache.getBaseWaypoints(),
-                cache.getTrajectoryModel(),
-                cache.getBaseTrajectoryPoints());
+        afterDStar,
+        dStarResult.affectedStartIndex(),
+        dStarResult.affectedEndIndex(),
+        cache.getTrajectoryModel(),
+        cache.getBaseTrajectoryPoints());
+
+        System.out.printf(
+        "[D*] affected window = %d -> %d%n",
+        dStarResult.affectedStartIndex(),
+        dStarResult.affectedEndIndex());
+
 
         return new TrajectoryResponse(
                 finalPoints,
@@ -153,7 +166,7 @@ public class TrajectoryService {
                 cache.getControlPoints(),
                 cache.getTrajectoryModel().getTotalDuration());
     }
-
+    
     // ── private helpers ───────────────────────────────────────────────────────
 
     /**
@@ -161,74 +174,85 @@ public class TrajectoryService {
      * waypoints against the original, then resamples only that window and
      * splices the result back into the base trajectory.
      */
-    private List<TrajectoryPoint> applyBirdPatch(
-            List<Waypoint>        modified,
-            List<Waypoint>        original,
-            TrajectoryModel       model,
-            List<TrajectoryPoint> basePoints) {
+private List<TrajectoryPoint> applyBirdPatch(
+        List<Waypoint> modified,
+        int affectedStart,
+        int affectedEnd,
+        TrajectoryModel model,
+        List<TrajectoryPoint> basePoints) {
 
-        // Find the first and last waypoint index that actually changed.
-        int firstChanged = -1;
-        int lastChanged  = -1;
-
-        int len = Math.min(modified.size(), original.size());
-        for (int i = 0; i < len; i++) {
-            if (waypointDiffers(modified.get(i), original.get(i))) {
-                if (firstChanged == -1) firstChanged = i;
-                lastChanged = i;
-            }
-        }
-
-        // No difference found — return base unchanged.
-        if (firstChanged == -1) {
-            return basePoints;
-        }
-
-        // Convert waypoint indices to mission time for the sampling window.
-        // Add a small margin so the splice joins smoothly.
-        double windowStart = modified.get(Math.max(0, firstChanged - 1)).getT();
-        double windowEnd   = modified.get(
-                Math.min(modified.size() - 1, lastChanged + 1)).getT();
-
-        System.out.printf("[TrajectoryService] Bird patch: resampling window " +
-                          "t=%.2f → t=%.2f (waypoints %d–%d)%n",
-                          windowStart, windowEnd, firstChanged, lastChanged);
-
-        // Rebuild a temporary model for just the affected waypoints so the
-        // B-spline reflects the D* Lite detour geometry in that window.
-        List<Waypoint> windowWaypoints = modified.subList(
-                Math.max(0, firstChanged - 2),
-                Math.min(modified.size(), lastChanged + 3));
-
-        // Only refit the B-spline for the window segment if it has enough points.
-        // Fall back to the cached model if the window is too small.
-        TrajectoryModel windowModel = model;
-        if (windowWaypoints.size() >= 4) {
-            try {
-                List<Waypoint> windowControlPoints =
-                        leastSquaresFitter.fit(new ArrayList<>(windowWaypoints));
-                windowModel = buildModel(windowControlPoints, trajectoryCache.getLambda());
-            } catch (Exception e) {
-                System.out.printf("[TrajectoryService] Window refit failed (%s), " +
-                                  "using cached model for patch.%n", e.getMessage());
-                windowModel = model;
-            }
-        }
-
-        // Resample only the affected window using the window model.
-        List<TrajectoryPoint> patch = samplingService.sampleWindow(
-                windowModel, samplingInterval, windowStart, windowEnd);
-
-        // Splice the patch back into the full trajectory.
-        return samplingService.splice(basePoints, patch, windowStart, windowEnd);
+    if (affectedStart < 0 || affectedEnd < 0) {
+        return basePoints;
     }
 
-    private boolean waypointDiffers(Waypoint a, Waypoint b) {
-        return Math.abs(a.getX() - b.getX()) > 0.01
-            || Math.abs(a.getY() - b.getY()) > 0.01
-            || Math.abs(a.getZ() - b.getZ()) > 0.01;
+    double windowStart =
+            modified.get(Math.max(0, affectedStart - 1)).getT();
+
+    double windowEnd =
+            modified.get(
+                    Math.min(modified.size() - 1, affectedEnd + 1))
+                    .getT();
+
+    System.out.printf(
+            "[TrajectoryService] Bird patch: t=%.2f -> t=%.2f (wp %d-%d)%n",
+            windowStart,
+            windowEnd,
+            affectedStart,
+            affectedEnd);
+
+    int fitStart = Math.max(0, affectedStart - 2);
+    int fitEnd = Math.min(modified.size(), affectedEnd + 3);
+
+    List<Waypoint> windowWaypoints =
+            new ArrayList<>(modified.subList(fitStart, fitEnd));
+
+    TrajectoryModel windowModel;
+
+    try {
+
+        List<Waypoint> windowControlPoints =
+                leastSquaresFitter.fit(windowWaypoints);
+
+        double lambda =
+                trajectoryCache != null
+                        ? trajectoryCache.getLambda()
+                        : 0.0;
+
+        windowModel =
+                buildModel(windowControlPoints, lambda);
+
+    } catch (Exception e) {
+
+        System.out.printf(
+                "[TrajectoryService] Window refit failed: %s%n",
+                e.getMessage());
+
+        return basePoints;
     }
 
+    System.out.printf(
+    "[PATCH] windowStart=%.2f windowEnd=%.2f%n",
+    windowStart,
+    windowEnd);
+
+    List<TrajectoryPoint> patch =
+            samplingService.sampleWindow(
+                    windowModel,
+                    samplingInterval,
+                    windowStart,
+                    windowEnd);
+                    
+    System.out.printf(
+    "[PATCH] patch points=%d base points=%d%n",
+    patch.size(),
+    basePoints.size());
+    
+    return samplingService.splice(
+            basePoints,
+            patch,
+            windowStart,
+            windowEnd);
+}
     private List<Waypoint> applyRrtAvoidance(List<Waypoint> source,
                                               List<Obstacle> staticObstacles) {
         if (source == null || source.size() < 3) {
@@ -259,29 +283,31 @@ public class TrajectoryService {
         }
     }
 
-    private List<Waypoint> applyDStarAvoidance(List<Waypoint> source,
+    private DStarResult applyDStarAvoidance(List<Waypoint> source,
                                                 List<Obstacle> birdObstacles) {
         if (birdObstacles.isEmpty()) {
             System.out.println("[D*] Skipped — no bird obstacles");
-            return source;
+            return new DStarResult(source, -1, -1, false);
         }
         System.out.printf("[D*] Planning around %d bird obstacle(s)%n",
                 birdObstacles.size());
         try {
-            List<Waypoint> planned = dStarLitePlanner.plan(source, birdObstacles);
+            DStarResult result = dStarLitePlanner.plan(source, birdObstacles);
+
+            List<Waypoint> planned = result.waypoints();
             if (planned == source) {
                 System.out.println("[D*] No path found — keeping input");
-                return source;
+                return result;
             }
             if (hasSharpTurns(planned)) {
                 System.out.println("[D*] Rejected (sharp turn) — keeping input");
-                return source;
+                return result;
             }
             System.out.println("[D*] Path accepted");
-            return planned;
+            return result;
         } catch (Exception e) {
             System.out.printf("[D*] Error: %s — keeping input%n", e.getMessage());
-            return source;
+            return new DStarResult(source, -1, -1, false);
         }
     }
 
